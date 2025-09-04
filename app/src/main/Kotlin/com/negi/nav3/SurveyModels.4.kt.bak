@@ -39,7 +39,6 @@ data class RuntimeSnapshot(
         private val json = Json { encodeDefaults = true }
         fun fromJson(s: String): RuntimeSnapshot = json.decodeFromString(s)
     }
-
     fun toJson(): String = Companion.json.encodeToString(this)
 }
 
@@ -63,7 +62,7 @@ class SurveyGraph(
     val currentNodeId: String get() = _currentNodeId
 
     private val pendingQueue: ArrayDeque<PendingEntry> = ArrayDeque()
-    private val visited: MutableSet<String> = linkedSetOf() // insertion order preserved
+    private val visited: MutableSet<String> = linkedSetOf() // insertion-ordered
     private val historyNodeIds: ArrayDeque<String> = ArrayDeque()
     private val historySnapshots: ArrayDeque<RuntimeSnapshot> = ArrayDeque()
 
@@ -77,18 +76,16 @@ class SurveyGraph(
     // external pending (origin == null)
     private val externalPending: MutableSet<String> = linkedSetOf()
 
-    // ----- debug / invariants -----
+    // ----- debug -----
     private fun dumpState(tag: String) {
         fun pq() = pendingQueue.joinToString(",") { "${it.origin ?: "EXT"}->${it.nodeId}" }
         fun om() = originMap.entries.joinToString(";") { "${it.key}=[${it.value.joinToString(",")}]" }
         fun ca() = choiceAnswers.entries.joinToString(";") { "${it.key}=[${it.value.joinToString(",")}]" }
-        val msg =
-            "STATE[$tag]: current=${_currentNodeId} pending=(${pq()}) external=(${externalPending.joinToString(",")}) visited=(${visited.joinToString(",")}) choices=(${ca()}) originMap=(${om()})"
-        // Log.i(LOG_TAG, msg) // 必要なら有効化
+        val msg = "STATE[$tag]: current=${_currentNodeId} pending=(${pq()}) external=(${externalPending.joinToString(",")}) visited=(${visited.joinToString(",")}) choices=(${ca()}) originMap=(${om()})"
+        //Log.i(LOG_TAG, msg)
     }
 
     private fun assertInvariants() {
-
         if (!ENABLE_ASSERTS) return
         check(pendingQueue.map { it.nodeId }.distinct().size == pendingQueue.size) { "pendingQueue must be unique by nodeId" }
         pendingQueue.filter { it.origin == null }.forEach {
@@ -116,27 +113,23 @@ class SurveyGraph(
         originMap = originMap.mapValues { ArrayList(it.value) }
     )
 
-    @Synchronized
-    fun snapshotJson(): String = snapshot().toJson()
+    @Synchronized fun snapshotJson(): String = snapshot().toJson()
 
     @Synchronized
     fun restore(s: RuntimeSnapshot) {
         _currentNodeId = s.currentNodeId
-
         pendingQueue.clear(); pendingQueue.addAll(s.pendingQueue)
         visited.clear(); visited.addAll(s.visited)
         historyNodeIds.clear(); historyNodeIds.addAll(s.historyNodeIds)
-
         choiceAnswers.clear(); choiceAnswers.putAll(s.choiceAnswers)
         textAnswers.clear(); textAnswers.putAll(s.textAnswers)
-
-        originMap.clear()
-        s.originMap.forEach { (k, v) -> originMap[k] = v.toMutableSet() }
+        originMap.clear(); s.originMap.forEach { (k, v) -> originMap[k] = v.toMutableSet() }
 
         // rebuild externalPending from pendingQueue (origin == null)
         externalPending.clear()
         pendingQueue.filter { it.origin == null }.mapTo(externalPending) { it.nodeId }
 
+        debugDump("restore")
         assertInvariants()
     }
 
@@ -149,9 +142,7 @@ class SurveyGraph(
     // --- getters ---
     @Synchronized fun getNode(id: String): Node =
         nodes[id] ?: throw IllegalArgumentException("node '$id' not found")
-
     @Synchronized fun currentNode(): Node = nodes[_currentNodeId]!!
-
     @Synchronized fun pendingQueueSnapshot(): List<PendingEntry> = ArrayList(pendingQueue)
     @Synchronized fun choiceAnswersSnapshot(): Map<String, List<String>> = HashMap(choiceAnswers)
     @Synchronized fun textAnswersSnapshot(): Map<String, String> = HashMap(textAnswers)
@@ -282,11 +273,9 @@ class SurveyGraph(
     }
 
     // ------------------------------
-    // pendingQueue から「次に進むべき PendingEntry」を選ぶロジック
-    // order:
-    //   1) origin == current
-    //   2) origin != null && visited.contains(origin)
-    //   3) external (origin == null)
+    // selection helper: pendingQueue から「次に進むべき PendingEntry」を選ぶロジック
+    // order: 1) origin == current  -> 2) origin != null && visited.contains(origin) -> 3) external (origin == null)
+    // これを一箇所に集約して peek / advance の不一致を防ぐ
     // ------------------------------
     private fun selectFromPending(currentId: String): PendingEntry? {
         if (pendingQueue.isEmpty()) return null
@@ -314,6 +303,7 @@ class SurveyGraph(
         return null
     }
 
+    // sanitizedNextCandidate は上の helper を使う（includeQueue が false なら queue を無視）
     private fun sanitizedNextCandidate(currentId: String, includeQueue: Boolean = true): String {
         var selectedNode: String? = null
 
@@ -357,7 +347,6 @@ class SurveyGraph(
         val prevSelectedKeys = choiceAnswers[nodeId] ?: emptyList()
         val prevFromOrigin = originMap[nodeId]?.toSet() ?: emptySet()
         val prevFromChoice = linkedSetOf<String>()
-
         val prevOrderedKeys = resolvedOptionOrder(node, fixedOrder).filter { it in prevSelectedKeys }
         for (key in prevOrderedKeys) {
             val nexts = node.options[key] ?: emptyList()
@@ -366,7 +355,6 @@ class SurveyGraph(
                 prevFromChoice.add(nx)
             }
         }
-
         val prevChildren: Set<String> = (prevFromOrigin + prevFromChoice)
 
         val orderedKeys: List<String> = resolvedOptionOrder(node, fixedOrder).filter { it in selectedKeys }
@@ -402,7 +390,9 @@ class SurveyGraph(
         val toFrontInitial = (nodeId == _currentNodeId) && prevChildren.isEmpty()
         addPendingBatchPreservingOrder(nodeId, delta, toFrontInitial)
 
+        debugDump("after updateMultiAnswer")
         assertInvariants()
+
         pendingQueue.sortWithInPlace(Comparator { a, b -> a.nodeId.compareTo(b.nodeId) })
     }
 
@@ -456,6 +446,8 @@ class SurveyGraph(
             val delta = combined.filter { it !in prevChildren }
             val toFrontInitial = (nodeId == _currentNodeId) && prevChildren.isEmpty()
             addPendingBatchPreservingOrder(nodeId, delta, toFrontInitial)
+
+            debugDump("after updateSingleAnswer")
             assertInvariants()
         } else {
             originMap.remove(nodeId)
@@ -465,6 +457,7 @@ class SurveyGraph(
                 prevChildren.forEach { r -> removePendingIfUnreferenced(r) }
                 invalidateSubtreeFromRoots(prevChildren)
             }
+            debugDump("after updateSingleAnswer (cleared)")
             assertInvariants()
         }
     }
@@ -473,6 +466,7 @@ class SurveyGraph(
     fun updateFreeText(nodeId: String, text: String) {
         if (!nodes.containsKey(nodeId)) throw IllegalArgumentException("node '$nodeId' not found")
         textAnswers[nodeId] = text
+        debugDump("after updateFreeText")
         assertInvariants()
     }
 
@@ -483,6 +477,7 @@ class SurveyGraph(
         if (externalPending.contains(nodeId)) return false
         addOriginRef(null, nodeId)
         addPendingIfAbsent(null, nodeId, toFront = false)
+        debugDump("after enqueue")
         assertInvariants()
         return true
     }
@@ -496,32 +491,27 @@ class SurveyGraph(
         var selectedNode: String? = null
         var selectedOrigin: String? = null
 
-        // desiredNext は UI が表示している可能性が高い candidate
+        // まず peek 相当の候補を計算しておく（これが UI に表示されている可能性が高い）
         val desiredNext = sanitizedNextCandidate(_currentNodeId, includeQueue = true)
 
-        // Helper: desired ノードに紐づく pending entry を優先順位に基づいて探す
+        // Try to find a pending entry that corresponds to desiredNext with selection priority
         fun findPendingEntryForNode(nodeId: String): PendingEntry? {
-            // 1) origin == current
+            // priority: origin == currentId, then origin != null && visited.contains(origin), then origin == null
             pendingQueue.firstOrNull { it.nodeId == nodeId && it.origin == _currentNodeId }?.let { return it }
-
-            // 2) origin != null && visited.contains(origin)
             pendingQueue.firstOrNull {
                 it.nodeId == nodeId &&
                         it.origin != null &&
                         it.origin != _currentNodeId &&
                         visited.contains(it.origin)
             }?.let { return it }
-
-            // 3) external
             pendingQueue.firstOrNull { it.nodeId == nodeId && it.origin == null }?.let { return it }
-
             return null
         }
 
         val entryForDesired = if (pendingQueue.isNotEmpty()) findPendingEntryForNode(desiredNext) else null
 
         if (entryForDesired != null) {
-            // 指定した entry を削除（origin と nodeId の両方でマッチング）
+            // remove that specific entry (match both nodeId and origin)
             val tmp = pendingQueue.toMutableList()
             val idx = tmp.indexOfFirst { it.nodeId == entryForDesired.nodeId && it.origin == entryForDesired.origin }
             if (idx >= 0) {
@@ -535,7 +525,7 @@ class SurveyGraph(
                 selectedOrigin = removed.origin
             }
         } else {
-            // フォールバック: 通常の selectFromPending ロジック
+            // フォールバック: 従来の selectFromPending ロジックで選択する
             val sel = selectFromPending(_currentNodeId)
             if (sel != null) {
                 val tmp = pendingQueue.toMutableList()
@@ -553,7 +543,7 @@ class SurveyGraph(
             }
         }
 
-        // 次の遷移先の決定
+        // Decide nextId (either selected from pending or defaultNext)
         var nextId = selectedNode ?: nodes[_currentNodeId]?.defaultNext ?: END
         if (nextId.isBlank() || !nodes.containsKey(nextId)) nextId = END
 
@@ -563,6 +553,13 @@ class SurveyGraph(
         if (!target.forceRevisit && nextId != END) visited.add(nextId)
         _currentNodeId = nextId
 
+        // debug: if selectedNode != desiredNext, emit a dump for investigation
+        if (selectedNode != null && selectedNode != desiredNext) {
+            // mismatch が発生した場合に備えてログを残す
+            debugDump("advance_mismatch: desired=$desiredNext selected=$selectedNode (origin=$selectedOrigin)")
+        }
+
+        debugDump("after_advanceToNext")
         assertInvariants()
         return nextId
     }
@@ -572,14 +569,14 @@ class SurveyGraph(
         if (historySnapshots.isEmpty()) return false
         val snap = historySnapshots.removeLast()
 
-        // 現在の回答は保持（ユーザーの回答は back 後も残す）
+        // keep answers
         val keepChoice = HashMap(choiceAnswers)
         val keepText = HashMap(textAnswers)
 
-        // snapshot 構造を一旦復元
+        // restore struct to snapshot state first
         restore(snap)
 
-        // answers: snapshot の回答上に keepAnswer を上書きする（restore 後に最新の回答が反映される）
+        // merge answers (snapshot answers <- keepChoice overrides)
         val mergedChoice = HashMap<String, List<String>>().apply {
             putAll(snap.choiceAnswers)
             putAll(keepChoice)
@@ -589,22 +586,28 @@ class SurveyGraph(
             putAll(keepText)
         }
 
-        // --- originMap / pendingQueue を安全に再構築 ---
+        // --- Rebuild originMap and pendingQueue safely ---
+        // Strategy:
+        //  - Preserve snapshot originMap/pending for origins NOT in mergedChoice (unaffected origins).
+        //  - For each origin in mergedChoice, REPLACE its children with the ones derived from mergedChoice.
+        //  - Rebuild pendingQueue: start with preserved snapshot entries (external + origins not in mergedChoice),
+        //    then append derived children for mergedChoice origins (respecting visited/forceRevisit).
         val newOriginMap: MutableMap<String, MutableSet<String>> = mutableMapOf()
         val preservedOrigins = snap.originMap.keys.filter { it !in mergedChoice.keys }
         for (orig in preservedOrigins) {
             newOriginMap[orig] = snap.originMap[orig]?.toMutableSet() ?: linkedSetOf()
         }
 
-        // preserved snapshot pending (external 与太や、mergedChoice に含まれない origin の pending を保持)
+        // start newPending with snapshot pending entries that we preserve:
         val newPending = ArrayDeque<PendingEntry>()
         for (e in snap.pendingQueue) {
             if (e.origin == null || e.origin !in mergedChoice.keys) {
+                // preserve external and pending from origins not being recomputed
                 newPending.addLast(e)
             }
         }
 
-        // mergedChoice を元に derived children を計算し pending に追加（既存と重複しないように）
+        // Now for each node in mergedChoice, compute derived children and insert / replace
         val sortedNodeIds = mergedChoice.keys.sorted()
         for (nodeId in sortedNodeIds) {
             val node = nodes[nodeId] ?: continue
@@ -622,29 +625,38 @@ class SurveyGraph(
                 val nexts = node.options[key] ?: emptyList()
                 for (nx in nexts) {
                     if (nx.isBlank() || !nodes.containsKey(nx)) continue
+
+                    // skip self-loop re-add if not forceRevisit
                     if (nx == nodeId && nodes[nx]?.forceRevisit != true) continue
+
+                    // skip if already visited (and not forceRevisit)
                     if (visited.contains(nx) && nodes[nx]?.forceRevisit != true) continue
+
                     derivedSet.add(nx)
                 }
             }
 
             if (derivedSet.isNotEmpty()) {
+                // replace origin mapping for this origin
                 newOriginMap[nodeId] = derivedSet.toMutableSet()
+
+                // add pending entries for derived children (if not already present)
                 for (child in derivedSet) {
                     if (newPending.none { it.nodeId == child }) {
                         newPending.addLast(PendingEntry(origin = nodeId, nodeId = child))
                     }
                 }
             } else {
+                // if derivedSet is empty, ensure any previous mapping for this origin is removed (we're replacing)
                 newOriginMap.remove(nodeId)
             }
         }
 
-        // externalPending を再計算
+        // compute newExternalPending
         val newExternalPending: MutableSet<String> = linkedSetOf()
         newPending.filter { it.origin == null }.forEach { newExternalPending.add(it.nodeId) }
 
-        // 再構築した状態を適用
+        // apply rebuilt state
         pendingQueue.clear(); pendingQueue.addAll(newPending)
         pendingQueue.sortWithInPlace(Comparator { a, b -> a.nodeId.compareTo(b.nodeId) })
 
@@ -654,6 +666,7 @@ class SurveyGraph(
         choiceAnswers.clear(); choiceAnswers.putAll(mergedChoice)
         textAnswers.clear(); textAnswers.putAll(mergedText)
 
+        debugDump("after onBack(merged)")
         assertInvariants()
 
         return true
@@ -683,6 +696,8 @@ class SurveyGraph(
         textAnswers.clear()
         originMap.clear()
         _currentNodeId = startId
+
+        debugDump("after clearAll")
         assertInvariants()
     }
 
@@ -697,11 +712,11 @@ class SurveyGraph(
 /** sample builder (unchanged) */
 fun sampleBuild(): SurveyGraph {
     val nEnd = Node(id = END, defaultNext = END, text = "終了")
-    val n3 = Node(id = "Q3", text = "Q3 (まとめ)", defaultNext = END)
+    val n3  = Node(id = "Q3", text = "Q3 (まとめ)", defaultNext = END)
     val nF1 = Node(id = "Q2_A1", text = "Q2 - A のフォローアップ1", defaultNext = "Q3")
     val nF2 = Node(id = "Q2_A2", text = "Q2 - A のフォローアップ2", defaultNext = "Q3")
-    val nB = Node(id = "Q2_B1", text = "Q2 - B のフォローアップ1", defaultNext = "Q3")
-    val nR = Node(id = "Q2_C1", text = "Q2 - C のフォローアップ1", defaultNext = "Q3")
+    val nB  = Node(id = "Q2_B1", text = "Q2 - B のフォローアップ1", defaultNext = "Q3")
+    val nR  = Node(id = "Q2_C1", text = "Q2 - C のフォローアップ1", defaultNext = "Q3")
 
     val n2 = Node(
         id = "Q2",
@@ -723,7 +738,7 @@ fun sampleBuild(): SurveyGraph {
         text = "単一選択の質問 (Yes -> 続行, No -> 終了)",
         options = mapOf(
             "Yes" to listOf("Q2"),
-            "No" to listOf(END)
+            "No"  to listOf(END)
         ),
         minSelect = 1,
         allowMulti = false

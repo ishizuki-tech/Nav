@@ -107,6 +107,7 @@ class GraphController(
             try { graph.debugDump("before_advanceToNext") } catch (_: Throwable) {}
         }
 
+        val peek = graph.peekNext()
         val next = graph.advanceToNext()
 
         // sync current
@@ -148,19 +149,19 @@ class GraphController(
  *  - 見つからなければ peekNext()、さらに defaultNext
  */
 fun computeTentativeNext(node: Node, selectedSet: Set<String>, controller: GraphController): String {
-    val baseOrder = node.optionOrder ?: emptyList()
-    val remainder = selectedSet.sorted().filter { it !in baseOrder }
-    val order = if (baseOrder.isEmpty()) selectedSet.sorted() else baseOrder + remainder
-
-    for (optKey in order) {
-        if (optKey !in selectedSet) continue
-        val targets = node.options[optKey] ?: emptyList()
-        for (t in targets) {
-            if (t.isNotBlank() && controller.nodeExists(t)) return t
-        }
-    }
+//    val baseOrder = node.optionOrder ?: emptyList()
+//    val remainder = selectedSet.sorted().filter { it !in baseOrder }
+//    val order = if (baseOrder.isEmpty()) selectedSet.sorted() else baseOrder + remainder
+//    for (optKey in order) {
+//        if (optKey !in selectedSet) continue
+//        val targets = node.options[optKey] ?: emptyList()
+//        for (t in targets) {
+//            if (t.isNotBlank() && controller.nodeExists(t)) return t
+//        }
+//    }
 
     val peek = controller.peekNext()
+
     if (peek.isNotBlank() && peek != END && controller.nodeExists(peek)) return peek
 
     return node.defaultNext.takeIf { it.isNotBlank() && it != END && controller.nodeExists(it) } ?: END

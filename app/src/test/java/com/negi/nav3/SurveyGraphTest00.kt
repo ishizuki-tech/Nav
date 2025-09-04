@@ -7,48 +7,6 @@ import org.junit.Test
 class SurveyGraphTest64 {
 
     // ---------- Helpers ----------
-    fun sampleBuild(): SurveyGraph {
-
-        val nEnd = Node(id = END, defaultNext = END, text = "終了")
-
-        val n3  = Node(id = "Q3", text = "Q3 (まとめ)", defaultNext = END)
-        val nF1 = Node(id = "Q2_A1", text = "Q2 - A のフォローアップ1", defaultNext = "Q3")
-        val nF2 = Node(id = "Q2_A2", text = "Q2 - A のフォローアップ2", defaultNext = "Q3")
-        val nB  = Node(id = "Q2_B1", text = "Q2 - B のフォローアップ1", defaultNext = "Q3")
-        val nR  = Node(id = "Q2_C1", text = "Q2 - C のフォローアップ1", defaultNext = "Q3")
-
-        val n2 = Node(
-            id = "Q2",
-            text = "複数選択可の質問（最大2つまで）",
-            options = mapOf(
-                "A" to listOf("Q2_A1", "Q2_A2"),
-                "B" to listOf("Q2_B1"),
-                "C" to listOf("Q2_C1")
-            ),
-            minSelect = 1,
-            maxSelect = 2,
-            allowMulti = true,
-            optionOrder = listOf("B", "A", "C"),
-            defaultNext = "Q3"
-        )
-
-        val n1single = Node(
-            id = "Q1",
-            text = "単一選択の質問 (Yes -> 続行, No -> 終了)",
-            options = mapOf(
-                "Yes" to listOf("Q2"),
-                "No"  to listOf(END)
-            ),
-            minSelect = 1,
-            allowMulti = false
-        )
-
-        val nStart = Node(id = START, text = "最初の画面", defaultNext = "Q1")
-
-        val nodes = listOf(nStart, n1single, n2, n3, nF1, nF2, nB, nR, nEnd).associateBy { it.id }
-        return SurveyGraph(startId = START, nodes = nodes)
-    }
-
     private fun newG() = sampleBuild()
 
     private fun reachQ2(g: SurveyGraph) {
