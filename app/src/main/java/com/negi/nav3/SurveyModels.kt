@@ -1,0 +1,745 @@
+// file: SurveyGraph.kt
+package com.negi.nav3
+
+import java.util.ArrayDeque
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+
+/**
+ * SurveyGraph — clean, reference-aware pending queue.
+ *
+ * ポイント:
+ *  - PendingEntry(origin,nodeId) で「誰が enqueue したか」を保持（origin==null は外部）。
+ *  - pendingQueue は **nodeId 重複無し**（順序維持）。
+ *  - originMap: origin -> set(nodeIds) : origin が要求した子 nodeId 集合（値は child の素の nodeId）。
+ *  - externalPending: 外部 enqueue の nodeId 集合。
+ *  - 参照が無くなった nodeId は pending から除去。origin サブツリー無効化もサポート。
+ *
+ * スレッド安全: 破壊的 API は @Synchronized。
+ */
+
+const val START = "Start"
+const val END = "End"
+const val FINISHED = "FINISHED"
+
+@Serializable
+data class Node(
+    val id: String,
+    val text: String,
+    val options: Map<String, List<String>> = emptyMap(),
+    val defaultNext: String = END,
+    val minSelect: Int = 0,
+    val maxSelect: Int = Int.MAX_VALUE,
+    val allowMulti: Boolean = false,
+    val forceRevisit: Boolean = false,
+    val optionOrder: List<String>? = null
+)
+
+@Serializable
+data class PendingEntry(val origin: String? = null, val nodeId: String)
+
+@Serializable
+data class RuntimeSnapshot(
+    val currentNodeId: String,
+    val pendingQueue: List<PendingEntry>,
+    val visited: List<String>,
+    val historyNodeIds: List<String>,
+    val choiceAnswers: Map<String, List<String>>,
+    val textAnswers: Map<String, String>,
+    val originMap: Map<String, List<String>>
+) {
+    companion object {
+        private val json = Json { encodeDefaults = true }
+        fun fromJson(s: String): RuntimeSnapshot = json.decodeFromString(s)
+    }
+    fun toJson(): String = Companion.json.encodeToString(this)
+}
+
+class SurveyGraph(
+    val startId: String,
+    private val nodes: Map<String, Node>,
+    private val globalFixedOrder: List<String> = listOf("A", "B", "C", "D", "E"),
+    private val maxHistory: Int = Int.MAX_VALUE
+) {
+    init {
+        require(nodes.containsKey(startId)) { "startId '$startId' not found" }
+        require(nodes.containsKey(END)) { "graph must contain node with id = END ('$END')" }
+        require(maxHistory >= 1) { "maxHistory must be >= 1" }
+    }
+
+    private val LOG_TAG = "SurveyGraph"
+    private val ENABLE_ASSERTS = false
+
+    // runtime state
+    private var _currentNodeId: String = startId
+    val currentNodeId: String get() = _currentNodeId
+
+    private val pendingQueue: ArrayDeque<PendingEntry> = ArrayDeque()
+    private val visited: MutableSet<String> = linkedSetOf() // insertion-ordered
+    private val historyNodeIds: ArrayDeque<String> = ArrayDeque()
+    private val historySnapshots: ArrayDeque<RuntimeSnapshot> = ArrayDeque()
+
+    // answers
+    private val choiceAnswers: MutableMap<String, List<String>> = mutableMapOf()
+    private val textAnswers: MutableMap<String, String> = mutableMapOf()
+
+    // origin -> set(childNodeIds)  ※値は child の素の nodeId のみ
+    private val originMap: MutableMap<String, MutableSet<String>> = mutableMapOf()
+
+    // external pending (origin == null)
+    private val externalPending: MutableSet<String> = linkedSetOf()
+
+    // ----- debug -----
+    private fun dumpState(tag: String) {
+        fun pq() = pendingQueue.joinToString(",") { "${it.origin ?: "EXT"}->${it.nodeId}" }
+        fun om() = originMap.entries.joinToString(";") { "${it.key}=[${it.value.joinToString(",")}]" }
+        fun ca() = choiceAnswers.entries.joinToString(";") { "${it.key}=[${it.value.joinToString(",")}]" }
+        val msg = "STATE[$tag]: current=${_currentNodeId} pending=(${pq()}) external=(${externalPending.joinToString(",")}) visited=(${visited.joinToString(",")}) choices=(${ca()}) originMap=(${om()})"
+        //Log.i(LOG_TAG, msg)
+    }
+
+    private fun assertInvariants() {
+        if (!ENABLE_ASSERTS) return
+        check(pendingQueue.map { it.nodeId }.distinct().size == pendingQueue.size) { "pendingQueue must be unique by nodeId" }
+        pendingQueue.filter { it.origin == null }.forEach {
+            check(externalPending.contains(it.nodeId)) { "externalPending must contain ${it.nodeId}" }
+        }
+        originMap.forEach { (origin, children) ->
+            children.forEach { child ->
+                check(!child.contains(",")) { "originMap[$origin] contains invalid pair '$child'" }
+                check(nodes.containsKey(child)) { "originMap[$origin] contains unknown child '$child'" }
+            }
+        }
+    }
+
+    fun debugDump(tag: String) = dumpState(tag)
+
+    // --- snapshot / restore ---
+    @Synchronized
+    fun snapshot(): RuntimeSnapshot = RuntimeSnapshot(
+        currentNodeId = _currentNodeId,
+        pendingQueue = ArrayList(pendingQueue),
+        visited = ArrayList(visited),
+        historyNodeIds = ArrayList(historyNodeIds),
+        choiceAnswers = HashMap(choiceAnswers),
+        textAnswers = HashMap(textAnswers),
+        originMap = originMap.mapValues { ArrayList(it.value) }
+    )
+
+    @Synchronized fun snapshotJson(): String = snapshot().toJson()
+
+    @Synchronized
+    fun restore(s: RuntimeSnapshot) {
+        _currentNodeId = s.currentNodeId
+        pendingQueue.clear(); pendingQueue.addAll(s.pendingQueue)
+        visited.clear(); visited.addAll(s.visited)
+        historyNodeIds.clear(); historyNodeIds.addAll(s.historyNodeIds)
+        choiceAnswers.clear(); choiceAnswers.putAll(s.choiceAnswers)
+        textAnswers.clear(); textAnswers.putAll(s.textAnswers)
+        originMap.clear(); s.originMap.forEach { (k, v) -> originMap[k] = v.toMutableSet() }
+
+        // rebuild externalPending from pendingQueue (origin == null)
+        externalPending.clear()
+        pendingQueue.filter { it.origin == null }.mapTo(externalPending) { it.nodeId }
+
+        debugDump("restore")
+        assertInvariants()
+    }
+
+    @Synchronized
+    fun restoreFromJson(jsonStr: String) {
+        val s = RuntimeSnapshot.fromJson(jsonStr)
+        restore(s)
+    }
+
+    // --- getters ---
+    @Synchronized fun getNode(id: String): Node =
+        nodes[id] ?: throw IllegalArgumentException("node '$id' not found")
+    @Synchronized fun currentNode(): Node = nodes[_currentNodeId]!!
+    @Synchronized fun pendingQueueSnapshot(): List<PendingEntry> = ArrayList(pendingQueue)
+    @Synchronized fun choiceAnswersSnapshot(): Map<String, List<String>> = HashMap(choiceAnswers)
+    @Synchronized fun textAnswersSnapshot(): Map<String, String> = HashMap(textAnswers)
+    @Synchronized fun visitedSnapshot(): List<String> = ArrayList(visited)
+    @Synchronized fun originMapSnapshot(): Map<String, List<String>> = originMap.mapValues { ArrayList(it.value) }
+
+    // ----- helpers -----
+
+    // 大文字/小文字を無視して ABC 順にキーを整列（安定・決定的）
+    private fun abcOrder(keys: Collection<String>): List<String> =
+        keys.sortedWith(compareBy<String> { it.uppercase() }.thenBy { it })
+
+    private fun originsReferencing(nodeId: String): Set<String> =
+        originMap.entries.filter { it.value.contains(nodeId) }.map { it.key }.toSet()
+
+    private fun hasExternalPending(nodeId: String): Boolean = externalPending.contains(nodeId)
+
+    private fun addOriginRef(origin: String?, nodeId: String) {
+        if (origin == null) {
+            externalPending.add(nodeId)
+        } else {
+            val set = originMap.getOrPut(origin) { linkedSetOf() }
+            set.add(nodeId)
+        }
+    }
+
+    private fun removeOriginRef(origin: String?, nodeId: String) {
+        if (origin == null) {
+            externalPending.remove(nodeId)
+        } else {
+            originMap[origin]?.remove(nodeId)
+            if (originMap[origin]?.isEmpty() == true) originMap.remove(origin)
+        }
+    }
+
+    // nodeId 一意で pending に追加（origin はログ/再構築で保持）
+    private fun addPendingIfAbsent(origin: String?, nodeId: String, toFront: Boolean = false) {
+        if (nodeId == END) return
+        if (!nodes.containsKey(nodeId)) return
+        val exists = pendingQueue.any { it.nodeId == nodeId }
+        if (!exists) {
+            val entry = PendingEntry(origin = origin, nodeId = nodeId)
+            if (toFront) pendingQueue.addFirst(entry) else pendingQueue.addLast(entry)
+        }
+    }
+
+    // バッチ追加: toFront=true のときは **逆順で addFirst** → 最終的な順序を保持
+// 追加修正: 既に visited で再訪不可なノードは pending に戻さない（skip）
+    private fun addPendingBatchPreservingOrder(origin: String?, children: Collection<String>, toFront: Boolean) {
+        if (children.isEmpty()) return
+
+        // helper: skip if already visited and not forceRevisit
+        fun shouldSkip(child: String): Boolean {
+            val node = nodes[child] ?: return true // unknown => skip
+            if (visited.contains(child) && node.forceRevisit != true) return true
+            return false
+        }
+
+        if (toFront) {
+            // reverse iterate and addFirst so that children order is preserved
+            for (child in children.toList().asReversed()) {
+                if (shouldSkip(child)) continue
+                addOriginRef(origin, child)
+                addPendingIfAbsent(origin, child, toFront = true)
+            }
+        } else {
+            for (child in children) {
+                if (shouldSkip(child)) continue
+                addOriginRef(origin, child)
+                addPendingIfAbsent(origin, child, toFront = false)
+            }
+        }
+    }
+
+    private fun removePendingIfUnreferenced(nodeId: String) {
+        val refs = originsReferencing(nodeId)
+        val ext = hasExternalPending(nodeId)
+        if (refs.isEmpty() && !ext) {
+            if (pendingQueue.any { it.nodeId == nodeId }) {
+                val tmp = pendingQueue.toMutableList()
+                tmp.removeAll { it.nodeId == nodeId }
+                pendingQueue.clear(); pendingQueue.addAll(tmp)
+            }
+        }
+    }
+
+    /**
+     * ルート群から辿れるサブツリーを「そのルートからしか参照されていない」範囲で無効化。
+     */
+    private fun invalidateSubtreeFromRoots(roots: Collection<String>) {
+        if (roots.isEmpty()) return
+        val rootSet = roots.filter { it.isNotBlank() && it != END }.toSet()
+        if (rootSet.isEmpty()) return
+
+        val stack = ArrayDeque<String>()
+        val seen = mutableSetOf<String>()
+        rootSet.forEach { stack.addLast(it) }
+
+        while (stack.isNotEmpty()) {
+            val cur = stack.removeLast()
+            if (!seen.add(cur)) continue
+            if (!nodes.containsKey(cur)) continue
+
+            if (hasExternalPending(cur)) continue // 外部参照ありならスキップ
+
+            // rootSet 以外の origin が参照していればスキップ
+            val refs = originsReferencing(cur)
+            val otherRefs = refs.filter { it !in rootSet }
+            if (otherRefs.isNotEmpty()) continue
+
+            // rootSet 起源の参照を除去
+            for (origin in rootSet) removeOriginRef(origin, cur)
+
+            // ペンディングからも参照が消えたならエントリ削除
+            removePendingIfUnreferenced(cur)
+
+            // 子（cur が enqueue していたノード）を取得してから originMap[cur] を消す
+            val children = originMap[cur]?.toList() ?: emptyList()
+            originMap.remove(cur)
+
+            // 回答/訪問フラグもクリア
+            choiceAnswers.remove(cur)
+            textAnswers.remove(cur)
+            visited.remove(cur)
+
+            // 再帰
+            children.forEach { child ->
+                if (child.isNotBlank() && child != END) stack.addLast(child)
+            }
+        }
+    }
+
+    @Synchronized fun peekNext(): String = sanitizedNextCandidate(_currentNodeId, includeQueue = true)
+    @Synchronized fun getNextFrom(fromNodeId: String): String = sanitizedNextCandidate(fromNodeId, includeQueue = true)
+    @Synchronized fun peekNextFrom(fromNodeId: String): String = sanitizedNextCandidate(fromNodeId, includeQueue = false)
+
+    @Synchronized fun canGoNext(): Boolean {
+        if (_currentNodeId == END) return false
+        return peekNext() != END
+    }
+
+    @Synchronized fun canGoBack(): Boolean = historySnapshots.isNotEmpty()
+
+    // ----- update APIs -----
+    @Synchronized
+    fun updateMultiAnswer(
+        nodeId: String,
+        selectedKeys: List<String>,
+        replaceQueued: Boolean = true,
+        @Suppress("UNUSED_PARAMETER") fixedOrder: List<String>? = null
+    ) {
+        val node = nodes[nodeId] ?: throw IllegalArgumentException("node '$nodeId' not found")
+
+        // validation
+        if (!node.allowMulti && selectedKeys.size > 1) {
+            throw IllegalArgumentException("node '$nodeId' does not allow multiple selections")
+        }
+        val prevSelectedKeys = choiceAnswers[nodeId] ?: emptyList()
+        if (selectedKeys.size < node.minSelect) {
+            throw IllegalArgumentException("node '$nodeId' requires at least ${node.minSelect} selections")
+        }
+        if (selectedKeys.size > node.maxSelect) {
+            throw IllegalArgumentException("node '$nodeId' allows at most ${node.maxSelect} selections")
+        }
+
+        // --- derive prevChildren: union of originMap's current children and children derived from prevSelectedKeys ---
+        val prevFromOrigin = originMap[nodeId]?.toSet() ?: emptySet()
+        val prevFromChoice = linkedSetOf<String>()
+        val prevOrderedKeys = abcOrder(node.options.keys).filter { it in prevSelectedKeys }
+        for (key in prevOrderedKeys) {
+            val nexts = node.options[key] ?: emptyList()
+            for (nx in nexts) {
+                if (nx.isBlank() || !nodes.containsKey(nx)) continue
+                prevFromChoice.add(nx)
+            }
+        }
+        val prevChildren: Set<String> = (prevFromOrigin + prevFromChoice)
+
+        // --- derive newChildren (from current selection) ---
+        val orderedKeys: List<String> = abcOrder(node.options.keys).filter { it in selectedKeys }
+        val newChildren = linkedSetOf<String>()
+        for (key in orderedKeys) {
+            val nexts = node.options[key] ?: emptyList()
+            for (nx in nexts) {
+                if (nx.isBlank() || !nodes.containsKey(nx)) continue
+                newChildren.add(nx)
+            }
+        }
+
+        // persist current choice AFTER deriving prevChildren
+        choiceAnswers[nodeId] = selectedKeys.toList()
+
+        // combinedChildren semantics
+        val combinedChildren: Set<String> = if (replaceQueued) {
+            newChildren.toSet()
+        } else {
+            (prevChildren + newChildren).toSet()
+        }
+
+        // update originMap
+        originMap[nodeId] = combinedChildren.toMutableSet()
+
+        // if replaceQueued: remove roots that existed previously but no longer exist
+        if (replaceQueued && prevChildren.isNotEmpty()) {
+            val removed = prevChildren.filter { it !in combinedChildren }
+            if (removed.isNotEmpty()) {
+                removed.forEach { r -> removeOriginRef(nodeId, r) }
+                removed.forEach { r -> removePendingIfUnreferenced(r) }
+                invalidateSubtreeFromRoots(removed)
+            }
+        }
+
+        // add delta to pending (preserve order). initial front-insert only if prevChildren was empty
+        val delta = combinedChildren.filter { it !in prevChildren }
+        val toFrontInitial = (nodeId == _currentNodeId) && prevChildren.isEmpty()
+        addPendingBatchPreservingOrder(nodeId, delta, toFrontInitial)
+
+        debugDump("after updateMultiAnswer")
+        assertInvariants()
+    }
+
+    @Synchronized
+    fun updateSingleAnswer(nodeId: String, selectedKey: String?, replaceQueued: Boolean = true) {
+        val node = nodes[nodeId] ?: throw IllegalArgumentException("node '$nodeId' not found")
+        if (selectedKey != null && node.minSelect > 1) {
+            throw IllegalArgumentException("node '$nodeId' requires at least ${node.minSelect} selections; single-answer not allowed")
+        }
+
+        // derive prevChildren as union(originMap[nodeId], derived from previous choiceAnswers)
+        val prevFromOrigin = originMap[nodeId]?.toSet() ?: emptySet()
+        val prevFromChoice = linkedSetOf<String>()
+        val prevSelectedKeys = choiceAnswers[nodeId] ?: emptyList()
+        val prevOrderedKeys = node.optionOrder ?: node.options.keys.toList()
+        for (key in prevOrderedKeys.filter { it in prevSelectedKeys }) {
+            val nexts = node.options[key] ?: emptyList()
+            for (nx in nexts) {
+                if (nx.isBlank() || !nodes.containsKey(nx)) continue
+                prevFromChoice.add(nx)
+            }
+        }
+        val prevChildren: Set<String> = (prevFromOrigin + prevFromChoice)
+
+        // persist selection
+        val keys = selectedKey?.let { listOf(it) } ?: emptyList()
+        choiceAnswers[nodeId] = keys
+
+        if (selectedKey != null) {
+            val derived = linkedSetOf<String>()
+            val nexts = node.options[selectedKey] ?: emptyList()
+            for (nx in nexts) {
+                if (nx.isBlank() || !nodes.containsKey(nx)) continue
+                derived.add(nx)
+            }
+
+            val combined: Set<String> = if (replaceQueued) {
+                derived.toSet()
+            } else {
+                (prevChildren + derived).toSet()
+            }
+
+            originMap[nodeId] = combined.toMutableSet()
+
+            if (replaceQueued && prevChildren.isNotEmpty()) {
+                val removed = prevChildren.filter { it !in combined }
+                if (removed.isNotEmpty()) {
+                    removed.forEach { r -> removeOriginRef(nodeId, r) }
+                    removed.forEach { r -> removePendingIfUnreferenced(r) }
+                    invalidateSubtreeFromRoots(removed)
+                }
+            }
+
+            val delta = combined.filter { it !in prevChildren }
+            val toFrontInitial = (nodeId == _currentNodeId) && prevChildren.isEmpty()
+            addPendingBatchPreservingOrder(nodeId, delta, toFrontInitial)
+
+            debugDump("after updateSingleAnswer")
+            assertInvariants()
+        } else {
+            // clear
+            originMap.remove(nodeId)
+            choiceAnswers.remove(nodeId)
+            if (replaceQueued && prevChildren.isNotEmpty()) {
+                prevChildren.forEach { r -> removeOriginRef(nodeId, r) }
+                prevChildren.forEach { r -> removePendingIfUnreferenced(r) }
+                invalidateSubtreeFromRoots(prevChildren)
+            }
+            debugDump("after updateSingleAnswer (cleared)")
+            assertInvariants()
+        }
+    }
+
+    @Synchronized
+    fun updateFreeText(nodeId: String, text: String) {
+        if (!nodes.containsKey(nodeId)) throw IllegalArgumentException("node '$nodeId' not found")
+        textAnswers[nodeId] = text
+        //Log.i(LOG_TAG, "updateFreeText: node=$nodeId text=${text.take(80)}")
+        debugDump("after updateFreeText")
+        assertInvariants()
+    }
+
+    @Synchronized
+    fun enqueue(nodeId: String): Boolean {
+        if (nodeId == END) return false
+        if (!nodes.containsKey(nodeId)) return false
+        if (externalPending.contains(nodeId)) return false
+        addOriginRef(null, nodeId)
+        addPendingIfAbsent(null, nodeId, toFront = false)
+        //Log.i(LOG_TAG, "enqueue(external): $nodeId")
+        debugDump("after enqueue")
+        assertInvariants()
+        return true
+    }
+
+    private fun sanitizedNextCandidate(currentId: String, includeQueue: Boolean = true): String {
+        var selectedNode: String? = null
+
+        if (includeQueue && pendingQueue.isNotEmpty()) {
+            // 1) current-origin
+            pendingQueue.firstOrNull {
+                it.origin == currentId &&
+                        nodes.containsKey(it.nodeId) &&
+                        (it.nodeId != currentId || nodes[it.nodeId]?.forceRevisit == true)
+            }?.let { selectedNode = it.nodeId }
+
+            // 2) external
+            if (selectedNode == null) {
+                pendingQueue.firstOrNull {
+                    it.origin == null &&
+                            nodes.containsKey(it.nodeId) &&
+                            (it.nodeId != currentId || nodes[it.nodeId]?.forceRevisit == true)
+                }?.let { selectedNode = it.nodeId }
+            }
+
+            // 3) visited-origin
+            if (selectedNode == null) {
+                pendingQueue.firstOrNull {
+                    it.origin != null &&
+                            visited.contains(it.origin) &&
+                            nodes.containsKey(it.nodeId) &&
+                            (it.nodeId != currentId || nodes[it.nodeId]?.forceRevisit == true)
+                }?.let { selectedNode = it.nodeId }
+            }
+        }
+
+        // 4) defaultNext（visited-origin より後）
+        var nextId = selectedNode ?: nodes[currentId]?.defaultNext ?: END
+        if (nextId.isBlank() || !nodes.containsKey(nextId)) nextId = END
+        return nextId
+    }
+
+    @Synchronized
+    fun advanceToNext(): String {
+        val snap = snapshot()
+        while (historySnapshots.size >= maxHistory) historySnapshots.removeFirst()
+        historySnapshots.addLast(snap)
+
+        var selectedNode: String? = null
+        var selectedOrigin: String? = null
+
+        if (pendingQueue.isNotEmpty()) {
+            // 1) current-origin
+            pendingQueue.firstOrNull {
+                it.origin == _currentNodeId &&
+                        nodes.containsKey(it.nodeId) &&
+                        (it.nodeId != _currentNodeId || nodes[it.nodeId]?.forceRevisit == true)
+            }?.let { selectedNode = it.nodeId; selectedOrigin = it.origin }
+
+            // 2) visited-origin（currentId 以外）
+            if (selectedNode == null) {
+                pendingQueue.firstOrNull {
+                    it.origin != null &&
+                            it.origin != _currentNodeId &&
+                            visited.contains(it.origin) &&
+                            nodes.containsKey(it.nodeId) &&
+                            (it.nodeId != _currentNodeId || nodes[it.nodeId]?.forceRevisit == true)
+                }?.let { selectedNode = it.nodeId; selectedOrigin = it.origin }
+            }
+
+            // 3) external
+            if (selectedNode == null) {
+                pendingQueue.firstOrNull {
+                    it.origin == null &&
+                            nodes.containsKey(it.nodeId) &&
+                            (it.nodeId != _currentNodeId || nodes[it.nodeId]?.forceRevisit == true)
+                }?.let { selectedNode = it.nodeId; selectedOrigin = it.origin }
+            }
+        }
+
+        var nextId = selectedNode ?: nodes[_currentNodeId]?.defaultNext ?: END
+        if (nextId.isBlank() || !nodes.containsKey(nextId)) nextId = END
+
+        // （以下は既存ロジックそのまま：選ばれた pending を消費、history/visited 更新 など）
+        if (selectedNode != null) {
+            val tmp = pendingQueue.toMutableList()
+            val idx = tmp.indexOfFirst { it.nodeId == selectedNode && (selectedOrigin == null || it.origin == selectedOrigin) }
+            if (idx >= 0) {
+                val removed = tmp.removeAt(idx)
+                pendingQueue.clear(); pendingQueue.addAll(tmp)
+
+                // 1) 外部参照セットから削除（既存）
+                if (removed.origin == null) externalPending.remove(removed.nodeId)
+
+                // 2) 追加: originMap の参照も消す（pending を消費したので origin がその child を参照し続ける意味が無い）
+                //    これにより originMap[origin] が空ならキー自体も削除される。
+                if (removed.origin != null) {
+                    removeOriginRef(removed.origin, removed.nodeId)
+                }
+            }
+        }
+
+        historyNodeIds.addLast(_currentNodeId)
+
+        val target = nodes[nextId]!!
+        if (!target.forceRevisit && nextId != END) visited.add(nextId)
+        _currentNodeId = nextId
+
+        debugDump("after_advanceToNext")
+        assertInvariants()
+        return nextId
+    }
+
+    @Synchronized
+    fun onBack(): Boolean {
+        if (historySnapshots.isEmpty()) return false
+        val snap = historySnapshots.removeLast()
+
+        // keep answers
+        val keepChoice = HashMap(choiceAnswers)
+        val keepText = HashMap(textAnswers)
+
+        // restore struct
+        restore(snap)
+
+        // merge answers
+        val mergedChoice = HashMap<String, List<String>>().apply {
+            putAll(snap.choiceAnswers)
+            putAll(keepChoice)
+        }
+        val mergedText = HashMap<String, String>().apply {
+            putAll(snap.textAnswers)
+            putAll(keepText)
+        }
+
+        // rebuild deterministically
+        val newPending = ArrayDeque<PendingEntry>()
+        val newOriginMap: MutableMap<String, MutableSet<String>> = mutableMapOf()
+        val newExternalPending: MutableSet<String> = linkedSetOf()
+
+        val sortedNodeIds = mergedChoice.keys.sorted()
+        for (nodeId in sortedNodeIds) {
+            val node = nodes[nodeId] ?: continue
+            val selectedKeys = mergedChoice[nodeId] ?: continue
+
+            // ★ Multi は常に ABC 並び、Single は従来（optionOrder ?: globalFixedOrder）
+            val baseOrder: List<String> = if (node.allowMulti) {
+                abcOrder(node.options.keys)
+            } else {
+                node.optionOrder ?: globalFixedOrder
+            }
+            val orderedKeys = baseOrder.filter { it in selectedKeys }
+
+            val enqueued = mutableListOf<String>()
+            for (key in orderedKeys) {
+                val nexts = node.options[key] ?: emptyList()
+                for (nx in nexts) {
+                    if (nx.isBlank() || !nodes.containsKey(nx)) continue
+
+                    // 自己ループの再訪不可は除外
+                    if (nx == nodeId && nodes[nx]?.forceRevisit != true) continue
+
+                    // すでに visited で再訪不可なら pending に積まない
+                    if (visited.contains(nx) && nodes[nx]?.forceRevisit != true) continue
+
+                    if (newPending.none { it.nodeId == nx }) {
+                        newPending.addLast(PendingEntry(origin = nodeId, nodeId = nx))
+                    }
+                    enqueued.add(nx)
+                }
+            }
+            if (enqueued.isNotEmpty()) newOriginMap[nodeId] = enqueued.toMutableSet()
+        }
+
+        // append external from snapshot（nodeId 一意ルール）
+        for (entry in snap.pendingQueue) {
+            if (entry.origin == null) {
+                if (newPending.none { it.nodeId == entry.nodeId }) {
+                    newPending.addLast(PendingEntry(origin = null, nodeId = entry.nodeId))
+                }
+                newExternalPending.add(entry.nodeId)
+            }
+        }
+
+        // replace state
+        pendingQueue.clear(); pendingQueue.addAll(newPending)
+        originMap.clear(); newOriginMap.forEach { (k, v) -> originMap[k] = v.toMutableSet() }
+        externalPending.clear(); externalPending.addAll(newExternalPending)
+
+        choiceAnswers.clear(); choiceAnswers.putAll(mergedChoice)
+        textAnswers.clear(); textAnswers.putAll(mergedText)
+
+        //Log.i(LOG_TAG, "onBack: restored snapshot(current=${_currentNodeId}) mergedAnswers; pending=${pendingQueue.joinToString(",") { "${it.origin ?: "EXT"}->${it.nodeId}" }}")
+
+        debugDump("after onBack(merged)")
+        assertInvariants()
+
+        return true
+    }
+
+    @Synchronized
+    fun isFinished(): Boolean {
+        if (_currentNodeId == END) return true
+        return peekNext() == END
+    }
+
+    @Synchronized
+    fun allAnswers(): Map<String, Any> =
+        mutableMapOf<String, Any>().apply {
+            putAll(choiceAnswers)
+            putAll(textAnswers)
+        }
+
+    @Synchronized
+    fun clearAll() {
+        pendingQueue.clear()
+        externalPending.clear()
+        visited.clear()
+        historyNodeIds.clear()
+        historySnapshots.clear()
+        choiceAnswers.clear()
+        textAnswers.clear()
+        originMap.clear()
+        _currentNodeId = startId
+
+        debugDump("after clearAll")
+        assertInvariants()
+    }
+
+    // utilities
+    @Synchronized fun peekPendingCount(): Int = pendingQueue.size
+    @Synchronized fun hasAnswerFor(nodeId: String): Boolean = choiceAnswers.containsKey(nodeId) || textAnswers.containsKey(nodeId)
+    @Synchronized fun getChoiceAnswer(nodeId: String): List<String>? = choiceAnswers[nodeId]
+    @Synchronized fun getTextAnswer(nodeId: String): String? = textAnswers[nodeId]
+    @Synchronized fun getHistoryNodeIds(): List<String> = ArrayList(historyNodeIds)
+}
+
+/** sample builder */
+fun sampleBuild(): SurveyGraph {
+
+    val nEnd = Node(id = END, defaultNext = END, text = "終了")
+
+    val n3  = Node(id = "Q3", text = "Q3 (まとめ)", defaultNext = END)
+    val nF1 = Node(id = "Q2_A1", text = "Q2 - A のフォローアップ1", defaultNext = "Q3")
+    val nF2 = Node(id = "Q2_A2", text = "Q2 - A のフォローアップ2", defaultNext = "Q3")
+    val nB  = Node(id = "Q2_B1", text = "Q2 - B のフォローアップ1", defaultNext = "Q3")
+    val nR  = Node(id = "Q2_C1", text = "Q2 - C のフォローアップ1", defaultNext = "Q3")
+
+    val n2 = Node(
+        id = "Q2",
+        text = "複数選択可の質問（最大2つまで）",
+        options = mapOf(
+            "A" to listOf("Q2_A1", "Q2_A2"),
+            "B" to listOf("Q2_B1"),
+            "C" to listOf("Q2_C1")
+        ),
+        minSelect = 1,
+        maxSelect = 2,
+        allowMulti = true,
+        optionOrder = listOf("B", "A", "C"),
+        defaultNext = "Q3"
+    )
+
+    val n1single = Node(
+        id = "Q1",
+        text = "単一選択の質問 (Yes -> 続行, No -> 終了)",
+        options = mapOf(
+            "Yes" to listOf("Q2"),
+            "No"  to listOf(END)
+        ),
+        minSelect = 1,
+        allowMulti = false
+    )
+
+    val nStart = Node(id = START, text = "最初の画面", defaultNext = "Q1")
+
+    val nodes = listOf(nStart, n1single, n2, n3, nF1, nF2, nB, nR, nEnd).associateBy { it.id }
+    return SurveyGraph(startId = START, nodes = nodes)
+}
